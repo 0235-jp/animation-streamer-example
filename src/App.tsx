@@ -88,6 +88,7 @@ function App() {
   const [renderStatus, setRenderStatus] = useState<string | null>(null)
   const [renderError, setRenderError] = useState<string | null>(null)
   const [outputUrl, setOutputUrl] = useState<string | null>(null)
+  const [outputName, setOutputName] = useState<string>('animation.mp4')
 
   useEffect(
     () => () => {
@@ -337,7 +338,14 @@ function App() {
       const blob = new Blob([videoBuffer], { type: 'video/mp4' })
       const url = URL.createObjectURL(blob)
       resetOutput()
+      const timestamp = new Date()
+        .toISOString()
+        .replace(/[:.]/g, '-')
+        .replace('T', '_')
+        .replace('Z', '')
+      const fileName = `animation-${timestamp}.mp4`
       setOutputUrl(url)
+      setOutputName(fileName)
       cleanupTargets.push('output.mp4')
       setRenderStatus('完了しました')
 
@@ -597,16 +605,16 @@ function App() {
           {renderStatus && <span className="status">{renderStatus}</span>}
         </div>
         {renderError && <p className="status error">{renderError}</p>}
-        <div className="render-actions">
-          <button disabled={!plan || !analysis || renderBusy} onClick={handleRender}>
-            {renderBusy ? 'レンダリング中...' : '動画を書き出す'}
-          </button>
-          {outputUrl && (
-            <a className="file-button download" href={outputUrl} download="animation.mp4">
-              MP4 をダウンロード
-            </a>
-          )}
-        </div>
+      <div className="render-actions">
+        <button disabled={!plan || !analysis || renderBusy} onClick={handleRender}>
+          {renderBusy ? 'レンダリング中...' : '動画を書き出す'}
+        </button>
+        {outputUrl && (
+          <a className="file-button download" href={outputUrl} download={outputName}>
+            MP4 をダウンロード
+          </a>
+        )}
+      </div>
       </section>
     </div>
   )
