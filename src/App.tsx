@@ -727,6 +727,11 @@ function App() {
               >
                 {ttsBusy ? '処理中...' : '音声生成＆動画作成'}
               </button>
+              {outputUrl && (
+                <a className="file-button download" href={outputUrl} download={outputName}>
+                  MP4 をダウンロード
+                </a>
+              )}
             </div>
             {ttsStatus && <p className="status">{ttsStatus}</p>}
             {ttsError && <p className="status error">{ttsError}</p>}
