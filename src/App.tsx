@@ -45,6 +45,7 @@ interface VoicevoxSpeakerOption {
 
 const TTS_STORAGE_KEY = 'animation-streamer-example::tts-config'
 const TTS_PROVIDER_KEY = 'animation-streamer-example::tts-provider'
+const AUDIO_MODE_KEY = 'animation-streamer-example::audio-mode'
 
 const defaultTtsConfig: TtsUiConfig = {
   localEndpoint: 'http://localhost:50021',
@@ -308,8 +309,23 @@ function App() {
   const [renderError, setRenderError] = useState<string | null>(null)
   const [outputUrl, setOutputUrl] = useState<string | null>(null)
   const [outputName, setOutputName] = useState<string>('animation.mp4')
-  const [audioSetupMode, setAudioSetupMode] = useState<'tts' | 'upload'>('tts')
-  const [ttsProvider, setTtsProvider] = useState<TtsProvider>('local')
+const getInitialAudioMode = (): 'tts' | 'upload' => {
+  if (typeof window === 'undefined') return 'tts'
+  const stored = window.localStorage.getItem(AUDIO_MODE_KEY)
+  return stored === 'upload' ? 'upload' : 'tts'
+}
+
+const getInitialTtsProvider = (): TtsProvider => {
+  if (typeof window === 'undefined') return 'local'
+  const stored = window.localStorage.getItem(TTS_PROVIDER_KEY)
+  if (stored === 'local' || stored === 'cloudSlow' || stored === 'cloudFast') {
+    return stored
+  }
+  return 'local'
+}
+
+const [audioSetupMode, setAudioSetupMode] = useState<'tts' | 'upload'>(() => getInitialAudioMode())
+const [ttsProvider, setTtsProvider] = useState<TtsProvider>(() => getInitialTtsProvider())
   const [ttsText, setTtsText] = useState('')
   const [ttsBusy, setTtsBusy] = useState(false)
   const [ttsStatus, setTtsStatus] = useState<string | null>(null)
@@ -421,14 +437,11 @@ function App() {
   useEffect(() => {
     if (typeof window === 'undefined') return
     try {
-      const stored = window.localStorage.getItem(TTS_PROVIDER_KEY)
-      if (stored === 'local' || stored === 'cloudSlow' || stored === 'cloudFast') {
-        setTtsProvider(stored)
-      }
+      window.localStorage.setItem(AUDIO_MODE_KEY, audioSetupMode)
     } catch {
       // ignore
     }
-  }, [])
+  }, [audioSetupMode])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
