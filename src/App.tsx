@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ChangeEvent, DragEvent } from 'react'
 import type { FFmpeg as FFmpegInstance } from '@ffmpeg/ffmpeg'
-import { fetchFile } from '@ffmpeg/util'
-import JSZip from 'jszip'
+import type JSZip from 'jszip'
 import './App.css'
 import {
   analyzeAudio,
@@ -256,9 +255,11 @@ const loadFfmpegConstructor = async (): Promise<new () => FFmpegInstance> => {
 }
 
 const extractZipVideos = async (files: File[]): Promise<ClipCandidate[]> => {
+  if (!files.length) return []
+  const { default: JSZipModule } = await import('jszip')
   const extracted: ClipCandidate[] = []
   for (const zipFile of files) {
-    const zip = await JSZip.loadAsync(await zipFile.arrayBuffer())
+    const zip = await JSZipModule.loadAsync(await zipFile.arrayBuffer())
     const manifestEntry = Object.values(zip.files).find(
       (entry) => !entry.dir && entry.name.split('/').pop()?.toLowerCase() === videoTypeManifestFile
     )
@@ -479,13 +480,13 @@ const [ttsProvider, setTtsProvider] = useState<TtsProvider>(() => getInitialTtsP
     }
   }, [analysis, clips])
 
-  const ensureFfmpeg = async (): Promise<FFmpegInstance> => {
+  const ensureFfmpeg = useCallback(async (): Promise<FFmpegInstance> => {
     if (!ffmpegRef.current) {
       const FFmpegConstructor = await loadFfmpegConstructor()
       ffmpegRef.current = new FFmpegConstructor()
-          const handleLog = ({ message }: { message: string }) => {
-            console.info('[ffmpeg]', message)
-          }
+      const handleLog = ({ message }: { message: string }) => {
+        console.info('[ffmpeg]', message)
+      }
       ffmpegRef.current.on('log', handleLog)
       logHandlerRef.current = handleLog
     }
@@ -506,12 +507,12 @@ const [ttsProvider, setTtsProvider] = useState<TtsProvider>(() => getInitialTtsP
 
     if (!ffmpegRef.current) throw new Error('FFmpeg not available')
     return ffmpegRef.current
-  }
+  }, [ffmpegLoaded])
 
-  const resetOutput = () => {
+  const resetOutput = useCallback(() => {
     if (outputUrl) URL.revokeObjectURL(outputUrl)
     setOutputUrl(null)
-  }
+  }, [outputUrl])
 
   const processAudioFile = async (file: File) => {
     setAudioFile(file)
@@ -625,14 +626,20 @@ const [ttsProvider, setTtsProvider] = useState<TtsProvider>(() => getInitialTtsP
   const loadClipAsset = async (file: File, type: MotionType): Promise<ClipAsset> => {
     const url = URL.createObjectURL(file)
     clipUrls.current.add(url)
-    const duration = await readVideoDuration(url)
-    return {
-      id: createId(),
-      file,
-      url,
-      name: file.name,
-      duration: Number.isFinite(duration) && duration > 0 ? duration : 1,
-      type,
+    try {
+      const duration = await readVideoDuration(url)
+      return {
+        id: createId(),
+        file,
+        url,
+        name: file.name,
+        duration: Number.isFinite(duration) && duration > 0 ? duration : 1,
+        type,
+      }
+    } catch (error) {
+      URL.revokeObjectURL(url)
+      clipUrls.current.delete(url)
+      throw error
     }
   }
 
@@ -657,9 +664,13 @@ const [ttsProvider, setTtsProvider] = useState<TtsProvider>(() => getInitialTtsP
       if (zipFiles.length) {
         setVideoStatus('動画メタデータを読み込み中...')
       }
-      const assets = await Promise.all(
-        allVideos.map(({ file, typeHint }) => loadClipAsset(file, typeHint ?? 'idle'))
-      )
+      const assets: ClipAsset[] = []
+      for (const { file, typeHint } of allVideos) {
+        // 読み込みは順番に実施し、ブラウザのデコーダ負荷を抑える
+        // （大量の動画を同時に処理するとタブがフリーズしやすいため）。
+        const asset = await loadClipAsset(file, typeHint ?? 'idle')
+        assets.push(asset)
+      }
       setClips((prev) => [...prev, ...assets])
     } catch (error) {
       setVideoError(error instanceof Error ? error.message : '動画の読み込みに失敗しました')
@@ -707,15 +718,16 @@ const [ttsProvider, setTtsProvider] = useState<TtsProvider>(() => getInitialTtsP
     })
   }
 
-  const handleRender = async () => {
+  const handleRender = useCallback(async () => {
     if (!plan || !analysis) return
     setRenderBusy(true)
     setRenderStatus('FFmpeg を初期化しています...')
     setRenderError(null)
+    const cleanupTargets: string[] = []
+    let ffmpeg: FFmpegInstance | null = null
     try {
-      const ffmpeg = await ensureFfmpeg()
-
-      const cleanupTargets: string[] = []
+      ffmpeg = await ensureFfmpeg()
+      const { fetchFile } = await import('@ffmpeg/util')
 
       setRenderStatus('音声トラックを整列しています...')
       const alignedBuffer = buildAlignedAudioBuffer(analysis.buffer, plan.talkPlans, plan.totalDuration)
@@ -772,27 +784,28 @@ const [ttsProvider, setTtsProvider] = useState<TtsProvider>(() => getInitialTtsP
       setOutputName(fileName)
       cleanupTargets.push('output.mp4')
       setRenderStatus('完了しました')
-
-      for (const target of cleanupTargets) {
-        try {
-          await ffmpeg.deleteFile(target)
-        } catch {
-          // virtual FS cleanup best-effort
-        }
-      }
     } catch (error) {
       setRenderError(error instanceof Error ? error.message : 'レンダリングに失敗しました')
     } finally {
+      if (ffmpeg) {
+        for (const target of cleanupTargets) {
+          try {
+            await ffmpeg.deleteFile(target)
+          } catch {
+            // virtual FS cleanup best-effort
+          }
+        }
+      }
       setRenderBusy(false)
     }
-  }
+  }, [analysis, plan, resetOutput, ensureFfmpeg])
 
   useEffect(() => {
     if (!pendingAutoRender) return
     if (analysisBusy || renderBusy || !analysis || !plan) return
     setPendingAutoRender(false)
     void handleRender()
-  }, [pendingAutoRender, analysis, plan, analysisBusy, renderBusy])
+  }, [pendingAutoRender, analysis, plan, analysisBusy, renderBusy, handleRender])
 
   return (
     <div className="app">
