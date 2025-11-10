@@ -365,9 +365,7 @@ const [ttsProvider, setTtsProvider] = useState<TtsProvider>(() => getInitialTtsP
       setSpeakerOptions(null)
       setSpeakerError(null)
       try {
-        const list = await fetchVoicevoxCloudSpeakers(
-          provider === 'cloudFast' ? ttsConfig.cloudFastApiKey.trim() || undefined : undefined
-        )
+        const list = await fetchVoicevoxCloudSpeakers(ttsConfig.cloudFastApiKey.trim() || undefined)
         const options = list.flatMap((speaker) =>
           speaker.styles
             .filter((style) => !style.type || style.type === 'talk')
@@ -379,11 +377,10 @@ const [ttsProvider, setTtsProvider] = useState<TtsProvider>(() => getInitialTtsP
         setSpeakerOptions(options)
         if (options.length) {
           applyTtsConfig((prev) => {
-            const targetKey = provider === 'cloudFast' ? 'cloudFastSpeakerId' : 'cloudSlowSpeakerId'
-            if (options.some((opt) => String(opt.id) === prev[targetKey])) {
+            if (options.some((opt) => String(opt.id) === prev.cloudFastSpeakerId)) {
               return prev
             }
-            return { ...prev, [targetKey]: String(options[0].id) }
+            return { ...prev, cloudFastSpeakerId: String(options[0].id) }
           })
         }
       } catch (error) {
@@ -902,37 +899,17 @@ const [ttsProvider, setTtsProvider] = useState<TtsProvider>(() => getInitialTtsP
                     https://voicevox.su-shiki.com/su-shikiapis/ttsquest/
                   </a>
                 </p>
-                <div className="speaker-row">
-                  <label className="input-field">
-                    <span>話者</span>
-                    <select
-                      value={ttsConfig.cloudSlowSpeakerId}
-                      onChange={(event) => updateTtsConfig({ cloudSlowSpeakerId: event.target.value })}
-                      disabled={speakerLoading || !speakerOptions?.length || ttsBusy}
-                    >
-                      {speakerOptions?.length ? (
-                        speakerOptions.map((option) => (
-                          <option key={option.id} value={option.id}>
-                            {option.label}
-                          </option>
-                        ))
-                      ) : (
-                        <option value="" disabled>
-                          {speakerLoading ? '話者を取得中...' : '話者一覧を読み込んでください'}
-                        </option>
-                      )}
-                    </select>
-                  </label>
-                  <button
-                    type="button"
-                    className="refresh-button"
-                    onClick={handleRefreshSpeakers}
-                    disabled={speakerLoading}
-                  >
-                    {speakerLoading ? '更新中...' : '話者を更新'}
-                  </button>
-                </div>
-                {speakerError && <p className="status error">{speakerError}</p>}
+                <label className="input-field">
+                  <span>話者 ID</span>
+                  <input
+                    type="number"
+                    min="0"
+                    step="1"
+                    value={ttsConfig.cloudSlowSpeakerId}
+                    onChange={(event) => updateTtsConfig({ cloudSlowSpeakerId: event.target.value })}
+                    disabled={ttsBusy}
+                  />
+                </label>
               </>
             ) : (
               <>
