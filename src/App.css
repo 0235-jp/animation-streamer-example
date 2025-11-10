@@ -78,6 +78,12 @@ h1 {
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
 }
 
+.speech-panel {
+  gap: 1rem;
+  display: flex;
+  flex-direction: column;
+}
+
 .dropzone {
   margin-top: 1rem;
   padding: 1.5rem;
@@ -107,6 +113,12 @@ h1 {
   border-color: #38bdf8;
   background: rgba(14, 165, 233, 0.08);
   transform: translateY(-1px);
+}
+
+.primary-drop {
+  margin-top: 0.75rem;
+  border-color: rgba(148, 163, 184, 0.8);
+  background: rgba(15, 23, 42, 0.75);
 }
 
 .dropzone-title {
@@ -164,6 +176,27 @@ h1 {
 
 .status.error {
   color: #fca5a5;
+}
+
+.panel-header-tags {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.file-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.35rem 0.9rem;
+  border-radius: 999px;
+  background: rgba(59, 130, 246, 0.2);
+  color: #bfdbfe;
+  font-size: 0.85rem;
+  border: 1px solid rgba(59, 130, 246, 0.3);
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .card-grid {
@@ -283,6 +316,8 @@ tbody tr:hover {
   background: rgba(255, 255, 255, 0.02);
 }
 
+input,
+textarea,
 select,
 button {
   font: inherit;
@@ -291,6 +326,11 @@ button {
   border: 1px solid rgba(148, 163, 184, 0.5);
   background: rgba(15, 23, 42, 0.8);
   color: inherit;
+}
+
+textarea {
+  resize: vertical;
+  min-height: 100px;
 }
 
 button {
@@ -304,6 +344,12 @@ button:hover:not(:disabled) {
 }
 
 button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+input:disabled,
+textarea:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
@@ -325,6 +371,61 @@ button:disabled {
   border-radius: 999px;
   font-size: 0.8rem;
   background: rgba(148, 163, 184, 0.15);
+}
+
+.speech-mode-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.speech-mode-option {
+  position: relative;
+  padding: 0.65rem 1rem;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  transition: border-color 0.2s, background 0.2s;
+}
+
+.speech-mode-option input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.speech-mode-option span {
+  font-size: 0.9rem;
+}
+
+.speech-mode-option.is-active {
+  background: rgba(59, 130, 246, 0.18);
+  border-color: rgba(59, 130, 246, 0.65);
+  color: #e0f2fe;
+}
+
+.speech-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
+.primary-button {
+  background: linear-gradient(135deg, #2563eb, #7c3aed);
+  color: #fff;
+  border: none;
+  padding: 0.75rem 1.75rem;
+  border-radius: 999px;
+  font-weight: 600;
+}
+
+.secondary-button {
+  border-radius: 999px;
+  padding: 0.75rem 1.75rem;
+  border: 1px solid rgba(248, 250, 252, 0.3);
 }
 
 .badge {
@@ -390,4 +491,36 @@ button:disabled {
   max-height: 240px;
   overflow: auto;
   color: #a5f3fc;
+}
+
+.input-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+  color: #94a3b8;
+}
+
+.input-field span {
+  font-weight: 600;
+  color: #e2e8f0;
+}
+
+.tts-textarea {
+  min-height: 140px;
+  margin-top: 0.5rem;
+}
+
+.tts-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
+.tts-tip {
+  margin: 0;
+  color: #94a3b8;
+  font-size: 0.85rem;
 }

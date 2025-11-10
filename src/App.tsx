@@ -12,6 +12,7 @@ import {
   type AudioAnalysisResult,
 } from './lib/audio'
 import { buildTimelinePlan } from './lib/timeline'
+import { synthesizeVoicevox } from './lib/tts'
 import type { ClipAsset, MotionType, TimelinePlan } from './types'
 
 const motionLabels: Record<MotionType, string> = {
@@ -20,6 +21,33 @@ const motionLabels: Record<MotionType, string> = {
   speechLoopLarge: '発話→発話(大)',
   speechLoopSmall: '発話→発話(小)',
   speechToIdle: '発話→待機',
+}
+
+interface TtsUiConfig {
+  endpoint: string
+  speakerId: string
+}
+
+const TTS_STORAGE_KEY = 'animation-streamer-example::tts-config'
+
+const defaultTtsConfig: TtsUiConfig = {
+  endpoint: 'http://localhost:50021',
+  speakerId: '3',
+}
+
+const toStoredString = (value: unknown, fallback: string) => {
+  if (typeof value === 'string') return value
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value)
+  return fallback
+}
+
+const coerceTtsConfig = (raw: unknown): TtsUiConfig => {
+  if (!raw || typeof raw !== 'object') return defaultTtsConfig
+  const data = raw as Partial<Record<keyof TtsUiConfig, unknown>>
+  return {
+    endpoint: toStoredString(data.endpoint, defaultTtsConfig.endpoint),
+    speakerId: toStoredString(data.speakerId, defaultTtsConfig.speakerId),
+  }
 }
 
 const videoTypeManifestFile = 'video_types.json'
@@ -235,6 +263,13 @@ function App() {
   const [renderError, setRenderError] = useState<string | null>(null)
   const [outputUrl, setOutputUrl] = useState<string | null>(null)
   const [outputName, setOutputName] = useState<string>('animation.mp4')
+  const [audioSetupMode, setAudioSetupMode] = useState<'tts' | 'upload'>('tts')
+  const [ttsText, setTtsText] = useState('')
+  const [ttsBusy, setTtsBusy] = useState(false)
+  const [ttsStatus, setTtsStatus] = useState<string | null>(null)
+  const [ttsError, setTtsError] = useState<string | null>(null)
+  const [ttsConfig, setTtsConfig] = useState<TtsUiConfig>(defaultTtsConfig)
+  const [pendingAutoRender, setPendingAutoRender] = useState(false)
 
   useEffect(
     () => () => {
@@ -250,6 +285,34 @@ function App() {
       }
     }
   }, [])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    try {
+      const raw = window.localStorage.getItem(TTS_STORAGE_KEY)
+      if (!raw) return
+      const parsed = JSON.parse(raw) as { tts?: unknown }
+      if (parsed.tts) {
+        setTtsConfig(coerceTtsConfig(parsed.tts))
+      }
+    } catch {
+      // 破損した JSON は無視
+    }
+  }, [])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    try {
+      window.localStorage.setItem(
+        TTS_STORAGE_KEY,
+        JSON.stringify({
+          tts: ttsConfig,
+        })
+      )
+    } catch {
+      // ストレージが使えない環境では黙って諦める
+    }
+  }, [ttsConfig])
 
   useEffect(() => {
     if (!analysis || !clips.length) {
@@ -314,6 +377,37 @@ function App() {
       setAnalysisError(error instanceof Error ? error.message : '音声解析に失敗しました')
     } finally {
       setAnalysisBusy(false)
+    }
+  }
+
+  const handleTtsGenerate = async (options?: { autoRender?: boolean }) => {
+    if (!ttsText.trim()) {
+      setTtsError('読み上げるテキストを入力してください')
+      return
+    }
+    setTtsBusy(true)
+    setTtsStatus('VOICEVOX 互換 API で音声を生成しています...')
+    setTtsError(null)
+    try {
+      const normalizedText = ttsText.trim()
+      const speakerIdValue = (config: TtsUiConfig, fallback: number) => {
+        const parsed = Number(config.speakerId)
+        if (Number.isFinite(parsed) && parsed >= 0) return Math.floor(parsed)
+        return fallback
+      }
+      const file = await synthesizeVoicevox(normalizedText, {
+        endpoint: ttsConfig.endpoint,
+        speakerId: speakerIdValue(ttsConfig, 1),
+      })
+      await processAudioFile(file)
+      setTtsStatus('生成した音声を解析にセットしました')
+      setPendingAutoRender(Boolean(options?.autoRender))
+    } catch (error) {
+      setTtsStatus(null)
+      setTtsError(error instanceof Error ? error.message : '音声生成に失敗しました')
+      setPendingAutoRender(false)
+    } finally {
+      setTtsBusy(false)
     }
   }
 
@@ -522,6 +616,13 @@ function App() {
     }
   }
 
+  useEffect(() => {
+    if (!pendingAutoRender) return
+    if (analysisBusy || renderBusy || !analysis || !plan) return
+    setPendingAutoRender(false)
+    void handleRender()
+  }, [pendingAutoRender, analysis, plan, analysisBusy, renderBusy])
+
   return (
     <div className="app">
       <header>
@@ -535,32 +636,112 @@ function App() {
         </div>
       </header>
 
-      <section className="panel">
+      <section className="panel speech-panel">
         <div className="panel-header">
           <div>
-            <h2>1. 音声解析</h2>
-            <p>80ms ウィンドウで RMS を測定し、ヒステリシスで発話／無音に分類します。</p>
+            <h2>1. 音声準備</h2>
+            <p>音声ファイルをアップロードするか、テキストから VOICEVOX / AIVIS Speech で音声を生成します。</p>
           </div>
-          {audioFile && <span className="tag">{audioFile.name}</span>}
+          <div className="panel-header-tags">
+            {audioFile && <span className="file-pill">{audioFile.name}</span>}
+          </div>
         </div>
+        <div className="speech-mode-options">
+          <label className={`speech-mode-option ${audioSetupMode === 'tts' ? 'is-active' : ''}`}>
+            <input
+              type="radio"
+              name="audio-setup-mode"
+              value="tts"
+              checked={audioSetupMode === 'tts'}
+              onChange={() => setAudioSetupMode('tts')}
+            />
+            <span>テキストから生成（VOICEVOX / AIVIS Speech）</span>
+          </label>
+          <label className={`speech-mode-option ${audioSetupMode === 'upload' ? 'is-active' : ''}`}>
+            <input
+              type="radio"
+              name="audio-setup-mode"
+              value="upload"
+              checked={audioSetupMode === 'upload'}
+              onChange={() => setAudioSetupMode('upload')}
+            />
+            <span>音声ファイルをアップロード</span>
+          </label>
+        </div>
+        {audioSetupMode === 'tts' ? (
+          <>
+            <label className="input-field">
+              <span>VOICEVOX / AIVIS Speech API URL</span>
+              <input
+                type="text"
+                value={ttsConfig.endpoint}
+                onChange={(event) => setTtsConfig((prev) => ({ ...prev, endpoint: event.target.value }))}
+                placeholder="http://localhost:50021"
+                disabled={ttsBusy}
+              />
+            </label>
+            <label className="input-field">
+              <span>話者 ID</span>
+              <input
+                type="number"
+                min="0"
+                step="1"
+                value={ttsConfig.speakerId}
+                onChange={(event) => setTtsConfig((prev) => ({ ...prev, speakerId: event.target.value }))}
+                disabled={ttsBusy}
+              />
+            </label>
+            <label className="input-field">
+              <span>テキスト</span>
+              <textarea
+                className="tts-textarea"
+                placeholder="おはようございます。今日もいい天気ですね。"
+                value={ttsText}
+                onChange={(event) => setTtsText(event.target.value)}
+                disabled={ttsBusy}
+              />
+            </label>
+            <div className="speech-actions">
+              <button
+                type="button"
+                className="primary-button"
+                onClick={() => handleTtsGenerate()}
+                disabled={ttsBusy || !ttsText.trim()}
+              >
+                {ttsBusy ? '生成中...' : '音声を生成'}
+              </button>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => handleTtsGenerate({ autoRender: true })}
+                disabled={ttsBusy || !ttsText.trim() || !clips.length || renderBusy}
+              >
+                {ttsBusy ? '処理中...' : '音声生成＆動画作成'}
+              </button>
+            </div>
+            {ttsStatus && <p className="status">{ttsStatus}</p>}
+            {ttsError && <p className="status error">{ttsError}</p>}
+          </>
+        ) : (
+          <div
+            className={`dropzone primary-drop ${audioDragActive ? 'is-dragging' : ''}`}
+            onClick={handleAudioZoneClick}
+            onDragOver={handleAudioDragOver}
+            onDragLeave={handleAudioDragLeave}
+            onDrop={handleAudioDrop}
+          >
+            <p className="dropzone-title">音声ファイルをここにドラッグ＆ドロップ</p>
+            <p className="dropzone-sub">またはクリックして選択（WAV / MP3 など）</p>
+            {audioFile ? (
+              <p className="selected-file">選択中: {audioFile.name}</p>
+            ) : (
+              <p className="selected-file muted">まだ選択されていません</p>
+            )}
+            <input ref={audioInputRef} type="file" accept="audio/*" onChange={handleAudioChange} hidden />
+          </div>
+        )}
         {analysisBusy && <p className="status">音声を解析中...</p>}
         {analysisError && <p className="status error">{analysisError}</p>}
-        <div
-          className={`dropzone ${audioDragActive ? 'is-dragging' : ''}`}
-          onClick={handleAudioZoneClick}
-          onDragOver={handleAudioDragOver}
-          onDragLeave={handleAudioDragLeave}
-          onDrop={handleAudioDrop}
-        >
-          <p className="dropzone-title">音声ファイルをここにドラッグ＆ドロップ</p>
-          <p className="dropzone-sub">またはクリックして選択（WAV / MP3 など）</p>
-          {audioFile ? (
-            <p className="selected-file">選択中: {audioFile.name}</p>
-          ) : (
-            <p className="selected-file muted">まだ選択されていません</p>
-          )}
-          <input ref={audioInputRef} type="file" accept="audio/*" onChange={handleAudioChange} hidden />
-        </div>
         {analysis && (
           <div className="card-grid">
             <div className="card">
