@@ -811,7 +811,7 @@ const [ttsProvider, setTtsProvider] = useState<TtsProvider>(() => getInitialTtsP
         <div className="panel-header">
           <div>
             <h2>1. 音声準備</h2>
-            <p>音声ファイルをアップロードするか、テキストから VOICEVOX エンジン / VOICEVOX API（低速/高速）で音声を生成します。</p>
+            <p>音声ファイルをアップロードするか、テキストから音声を生成します。</p>
           </div>
           <div className="panel-header-tags">
             {audioFile && <span className="file-pill">{audioFile.name}</span>}
@@ -826,7 +826,7 @@ const [ttsProvider, setTtsProvider] = useState<TtsProvider>(() => getInitialTtsP
               checked={audioSetupMode === 'tts'}
               onChange={() => setAudioSetupMode('tts')}
             />
-            <span>テキストから生成（VOICEVOX / VOICEVOX API）</span>
+            <span>テキストから生成</span>
           </label>
           <label className={`speech-mode-option ${audioSetupMode === 'upload' ? 'is-active' : ''}`}>
             <input
