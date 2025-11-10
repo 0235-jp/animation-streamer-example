@@ -1,4 +1,7 @@
 const trimTrailingSlash = (value: string) => value.replace(/\/+$/, '')
+const VOICEVOX_CLOUD_ENDPOINT = 'https://api.tts.quest/v3/voicevox/synthesis'
+const VOICEVOX_FAST_ENDPOINT = 'https://deprecatedapis.tts.quest/v2/voicevox/audio/'
+const VOICEVOX_SPEAKERS_ENDPOINT = 'https://deprecatedapis.tts.quest/v2/voicevox/speakers/'
 
 const normalizeEndpoint = (value: string, label: string) => {
   const trimmed = value.trim()
@@ -16,6 +19,29 @@ const assertBrowserApis = () => {
 export interface VoicevoxRequestConfig {
   endpoint: string
   speakerId: number
+}
+
+export interface VoicevoxCloudRequestConfig {
+  speakerId: number
+  endpoint?: string
+}
+
+export interface VoicevoxCloudSpeaker {
+  name: string
+  styles: {
+    name: string
+    id: number
+    type?: string
+  }[]
+}
+
+export interface VoicevoxFastRequestConfig {
+  speakerId: number
+  apiKey: string
+  endpoint?: string
+  pitch?: number
+  intonationScale?: number
+  speed?: number
 }
 
 export const synthesizeVoicevox = async (text: string, config: VoicevoxRequestConfig): Promise<File> => {
@@ -60,6 +86,21 @@ export const synthesizeVoicevox = async (text: string, config: VoicevoxRequestCo
     type: synthResponse.headers.get('content-type') || 'audio/wav',
     lastModified: Date.now(),
   })
+}
+
+export const fetchVoicevoxCloudSpeakers = async (apiKey?: string): Promise<VoicevoxCloudSpeaker[]> => {
+  assertBrowserApis()
+  const url = new URL(VOICEVOX_SPEAKERS_ENDPOINT)
+  if (apiKey?.trim()) {
+    url.searchParams.set('key', apiKey.trim())
+  }
+  const response = await fetch(url.toString(), { cache: 'no-store' })
+  if (!response.ok) {
+    const message = await safeReadText(response)
+    throw new Error(`VOICEVOX API（話者一覧）の取得に失敗しました (${response.status}): ${message}`)
+  }
+  const data = (await response.json()) as VoicevoxCloudSpeaker[]
+  return data
 }
 
 export const synthesizeVoicevoxCloud = async (text: string, config: VoicevoxCloudRequestConfig): Promise<File> => {
@@ -153,16 +194,47 @@ const waitForVoicevoxCloudAudio = async (statusUrl: string) => {
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
+export const synthesizeVoicevoxFast = async (text: string, config: VoicevoxFastRequestConfig): Promise<File> => {
+  assertBrowserApis()
+  const normalizedText = text.trim()
+  if (!normalizedText) throw new Error('読み上げテキストを入力してください')
+  const apiKey = config.apiKey.trim()
+  if (!apiKey) throw new Error('VOICEVOX API（高速）の API キーを入力してください')
+
+  const endpoint = normalizeEndpoint(config.endpoint ?? VOICEVOX_FAST_ENDPOINT, 'VOICEVOX API（高速）エンドポイント')
+  const speakerId = Number.isFinite(config.speakerId) ? config.speakerId : 1
+  const params = new URLSearchParams({
+    text: normalizedText,
+    speaker: String(speakerId),
+    key: apiKey,
+    pitch: String(config.pitch ?? 0),
+    intonationScale: String(config.intonationScale ?? 1),
+    speed: String(config.speed ?? 1),
+  })
+  const response = await fetch(`${endpoint}?${params.toString()}`, { cache: 'no-store' })
+  const contentType = response.headers.get('content-type') || ''
+  if (!response.ok || contentType.includes('application/json') || contentType.startsWith('text/')) {
+    const message = await safeReadText(response)
+    throw new Error(
+      message && message !== 'null'
+        ? `VOICEVOX API（高速）でエラーが発生しました: ${message}`
+        : `VOICEVOX API（高速）が失敗しました (${response.status})`
+    )
+  }
+
+  const buffer = await response.arrayBuffer()
+  const type = contentType || 'audio/wav'
+  const extension = type.includes('mpeg') || type.includes('mp3') ? 'mp3' : 'wav'
+  return new File([buffer], `voicevox-fast_${Date.now()}.${extension}`, {
+    type,
+    lastModified: Date.now(),
+  })
+}
+
 const safeReadText = async (response: Response) => {
   try {
     return await response.text()
   } catch {
     return 'レスポンス本文を読み取れませんでした'
   }
-}
-const VOICEVOX_CLOUD_ENDPOINT = 'https://api.tts.quest/v3/voicevox/synthesis'
-
-export interface VoicevoxCloudRequestConfig {
-  speakerId: number
-  endpoint?: string
 }

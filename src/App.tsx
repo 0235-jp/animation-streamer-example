@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ChangeEvent, DragEvent } from 'react'
 import type { FFmpeg as FFmpegInstance } from '@ffmpeg/ffmpeg'
 import { fetchFile } from '@ffmpeg/util'
@@ -12,7 +12,12 @@ import {
   type AudioAnalysisResult,
 } from './lib/audio'
 import { buildTimelinePlan } from './lib/timeline'
-import { synthesizeVoicevox, synthesizeVoicevoxCloud } from './lib/tts'
+import {
+  fetchVoicevoxCloudSpeakers,
+  synthesizeVoicevox,
+  synthesizeVoicevoxCloud,
+  synthesizeVoicevoxFast,
+} from './lib/tts'
 import type { ClipAsset, MotionType, TimelinePlan } from './types'
 
 const motionLabels: Record<MotionType, string> = {
@@ -23,12 +28,19 @@ const motionLabels: Record<MotionType, string> = {
   speechToIdle: '発話→待機',
 }
 
-type TtsProvider = 'local' | 'cloud'
+type TtsProvider = 'local' | 'cloudSlow' | 'cloudFast'
 
 interface TtsUiConfig {
   localEndpoint: string
   localSpeakerId: string
-  cloudSpeakerId: string
+  cloudSlowSpeakerId: string
+  cloudFastSpeakerId: string
+  cloudFastApiKey: string
+}
+
+interface VoicevoxSpeakerOption {
+  id: number
+  label: string
 }
 
 const TTS_STORAGE_KEY = 'animation-streamer-example::tts-config'
@@ -37,7 +49,9 @@ const TTS_PROVIDER_KEY = 'animation-streamer-example::tts-provider'
 const defaultTtsConfig: TtsUiConfig = {
   localEndpoint: 'http://localhost:50021',
   localSpeakerId: '3',
-  cloudSpeakerId: '3',
+  cloudSlowSpeakerId: '3',
+  cloudFastSpeakerId: '3',
+  cloudFastApiKey: '',
 }
 
 const toStoredString = (value: unknown, fallback: string) => {
@@ -50,9 +64,20 @@ const coerceTtsConfig = (raw: unknown): TtsUiConfig => {
   if (!raw || typeof raw !== 'object') return defaultTtsConfig
   const data = raw as Partial<Record<keyof TtsUiConfig, unknown>>
   return {
-    localEndpoint: toStoredString(data.localEndpoint, defaultTtsConfig.localEndpoint),
-    localSpeakerId: toStoredString(data.localSpeakerId, defaultTtsConfig.localSpeakerId),
-    cloudSpeakerId: toStoredString(data.cloudSpeakerId, defaultTtsConfig.cloudSpeakerId),
+    localEndpoint: toStoredString(
+      data.localEndpoint ?? (data as { endpoint?: unknown }).endpoint,
+      defaultTtsConfig.localEndpoint
+    ),
+    localSpeakerId: toStoredString(
+      data.localSpeakerId ?? (data as { speakerId?: unknown }).speakerId,
+      defaultTtsConfig.localSpeakerId
+    ),
+    cloudSlowSpeakerId: toStoredString(
+      data.cloudSlowSpeakerId ?? (data as { cloudSpeakerId?: unknown }).cloudSpeakerId,
+      defaultTtsConfig.cloudSlowSpeakerId
+    ),
+    cloudFastSpeakerId: toStoredString(data.cloudFastSpeakerId, defaultTtsConfig.cloudFastSpeakerId),
+    cloudFastApiKey: toStoredString(data.cloudFastApiKey, defaultTtsConfig.cloudFastApiKey),
   }
 }
 
@@ -290,14 +315,77 @@ function App() {
   const [ttsStatus, setTtsStatus] = useState<string | null>(null)
   const [ttsError, setTtsError] = useState<string | null>(null)
   const [ttsConfig, setTtsConfig] = useState<TtsUiConfig>(defaultTtsConfig)
+  const [speakerOptions, setSpeakerOptions] = useState<VoicevoxSpeakerOption[] | null>(null)
+  const [speakerLoading, setSpeakerLoading] = useState(false)
+  const [speakerError, setSpeakerError] = useState<string | null>(null)
   const [pendingAutoRender, setPendingAutoRender] = useState(false)
 
-  const updateTtsConfig = (patch: Partial<TtsUiConfig>) => {
+  const applyTtsConfig = useCallback((updater: (prev: TtsUiConfig) => TtsUiConfig) => {
     setTtsConfig((prev) => {
-      const next = { ...prev, ...patch }
+      const next = updater(prev)
+      if (next === prev) return prev
       persistTtsConfig(next)
       return next
     })
+  }, [])
+
+  const updateTtsConfig = (patch: Partial<TtsUiConfig>) => {
+    applyTtsConfig((prev) => ({ ...prev, ...patch }))
+  }
+
+  const loadSpeakerOptions = useCallback(
+    async (provider: TtsProvider) => {
+      if (provider === 'local') {
+        setSpeakerOptions(null)
+        setSpeakerError(null)
+        return
+      }
+      if (provider === 'cloudFast' && !ttsConfig.cloudFastApiKey.trim()) {
+        setSpeakerOptions(null)
+        setSpeakerError('VOICEVOX API（高速）の API キーを入力してください')
+        return
+      }
+      setSpeakerLoading(true)
+      setSpeakerOptions(null)
+      setSpeakerError(null)
+      try {
+        const list = await fetchVoicevoxCloudSpeakers(
+          provider === 'cloudFast' ? ttsConfig.cloudFastApiKey.trim() || undefined : undefined
+        )
+        const options = list.flatMap((speaker) =>
+          speaker.styles
+            .filter((style) => !style.type || style.type === 'talk')
+            .map((style) => ({
+              id: style.id,
+              label: `${speaker.name}（${style.name}）`,
+            }))
+        )
+        setSpeakerOptions(options)
+        if (options.length) {
+          applyTtsConfig((prev) => {
+            const targetKey = provider === 'cloudFast' ? 'cloudFastSpeakerId' : 'cloudSlowSpeakerId'
+            if (options.some((opt) => String(opt.id) === prev[targetKey])) {
+              return prev
+            }
+            return { ...prev, [targetKey]: String(options[0].id) }
+          })
+        }
+      } catch (error) {
+        setSpeakerOptions(null)
+        setSpeakerError(error instanceof Error ? error.message : '話者一覧の取得に失敗しました')
+      } finally {
+        setSpeakerLoading(false)
+      }
+    },
+    [ttsConfig.cloudFastApiKey, applyTtsConfig]
+  )
+
+  const handleRefreshSpeakers = () => {
+    if (ttsProvider === 'cloudFast' && !ttsConfig.cloudFastApiKey.trim()) {
+      setSpeakerError('VOICEVOX API（高速）の API キーを入力してください')
+      return
+    }
+    void loadSpeakerOptions(ttsProvider)
   }
 
   useEffect(
@@ -334,7 +422,7 @@ function App() {
     if (typeof window === 'undefined') return
     try {
       const stored = window.localStorage.getItem(TTS_PROVIDER_KEY)
-      if (stored === 'local' || stored === 'cloud') {
+      if (stored === 'local' || stored === 'cloudSlow' || stored === 'cloudFast') {
         setTtsProvider(stored)
       }
     } catch {
@@ -350,6 +438,20 @@ function App() {
       // ignore
     }
   }, [ttsProvider])
+
+  useEffect(() => {
+    if (ttsProvider === 'local') {
+      setSpeakerOptions(null)
+      setSpeakerError(null)
+      return
+    }
+    if (ttsProvider === 'cloudFast' && !ttsConfig.cloudFastApiKey.trim()) {
+      setSpeakerOptions(null)
+      setSpeakerError('VOICEVOX API（高速）の API キーを入力してください')
+      return
+    }
+    void loadSpeakerOptions(ttsProvider)
+  }, [ttsProvider, ttsConfig.cloudFastApiKey, loadSpeakerOptions])
 
   useEffect(() => {
     if (!analysis || !clips.length) {
@@ -422,9 +524,17 @@ function App() {
       setTtsError('読み上げるテキストを入力してください')
       return
     }
+    if (ttsProvider === 'cloudFast' && !ttsConfig.cloudFastApiKey.trim()) {
+      setTtsError('VOICEVOX API（高速）の API キーを入力してください')
+      return
+    }
     setTtsBusy(true)
     setTtsStatus(
-      ttsProvider === 'local' ? 'VOICEVOX エンジンで音声を生成しています...' : 'VOICEVOX API（低速）で音声を生成しています...'
+      ttsProvider === 'local'
+        ? 'VOICEVOX エンジンで音声を生成しています...'
+        : ttsProvider === 'cloudSlow'
+          ? 'VOICEVOX API（低速）で音声を生成しています...'
+          : 'VOICEVOX API（高速）で音声を生成しています...'
     )
     setTtsError(null)
     try {
@@ -434,15 +544,22 @@ function App() {
         if (Number.isFinite(parsed) && parsed >= 0) return Math.floor(parsed)
         return fallback
       }
-      const file =
-        ttsProvider === 'local'
-          ? await synthesizeVoicevox(normalizedText, {
-              endpoint: ttsConfig.localEndpoint,
-              speakerId: speakerIdValue(ttsConfig.localSpeakerId, 1),
-            })
-          : await synthesizeVoicevoxCloud(normalizedText, {
-              speakerId: speakerIdValue(ttsConfig.cloudSpeakerId, 1),
-            })
+      let file: File
+      if (ttsProvider === 'local') {
+        file = await synthesizeVoicevox(normalizedText, {
+          endpoint: ttsConfig.localEndpoint,
+          speakerId: speakerIdValue(ttsConfig.localSpeakerId, 1),
+        })
+      } else if (ttsProvider === 'cloudSlow') {
+        file = await synthesizeVoicevoxCloud(normalizedText, {
+          speakerId: speakerIdValue(ttsConfig.cloudSlowSpeakerId, 1),
+        })
+      } else {
+        file = await synthesizeVoicevoxFast(normalizedText, {
+          speakerId: speakerIdValue(ttsConfig.cloudFastSpeakerId, 1),
+          apiKey: ttsConfig.cloudFastApiKey.trim(),
+        })
+      }
       await processAudioFile(file)
       setTtsStatus('生成した音声を解析にセットしました')
       setPendingAutoRender(Boolean(options?.autoRender))
@@ -684,7 +801,7 @@ function App() {
         <div className="panel-header">
           <div>
             <h2>1. 音声準備</h2>
-            <p>音声ファイルをアップロードするか、テキストから VOICEVOX エンジン / VOICEVOX API（低速）で音声を生成します。</p>
+            <p>音声ファイルをアップロードするか、テキストから VOICEVOX エンジン / VOICEVOX API（低速/高速）で音声を生成します。</p>
           </div>
           <div className="panel-header-tags">
             {audioFile && <span className="file-pill">{audioFile.name}</span>}
@@ -725,11 +842,19 @@ function App() {
               </button>
               <button
                 type="button"
-                className={`tts-provider-button ${ttsProvider === 'cloud' ? 'is-active' : ''}`}
-                onClick={() => setTtsProvider('cloud')}
+                className={`tts-provider-button ${ttsProvider === 'cloudSlow' ? 'is-active' : ''}`}
+                onClick={() => setTtsProvider('cloudSlow')}
                 disabled={ttsBusy}
               >
                 VOICEVOX API（低速）
+              </button>
+              <button
+                type="button"
+                className={`tts-provider-button ${ttsProvider === 'cloudFast' ? 'is-active' : ''}`}
+                onClick={() => setTtsProvider('cloudFast')}
+                disabled={ttsBusy}
+              >
+                VOICEVOX API（高速）
               </button>
             </div>
             {ttsProvider === 'local' ? (
@@ -756,7 +881,7 @@ function App() {
                   />
                 </label>
               </>
-            ) : (
+            ) : ttsProvider === 'cloudSlow' ? (
               <>
                 <p className="tts-tip">
                   WEB版 VOICEVOX API（低速）で音声を生成します。生成完了まで数秒～数十秒かかる場合があります。{' '}
@@ -764,17 +889,89 @@ function App() {
                     https://voicevox.su-shiki.com/su-shikiapis/ttsquest/
                   </a>
                 </p>
+                <div className="speaker-row">
+                  <label className="input-field">
+                    <span>話者</span>
+                    <select
+                      value={ttsConfig.cloudSlowSpeakerId}
+                      onChange={(event) => updateTtsConfig({ cloudSlowSpeakerId: event.target.value })}
+                      disabled={speakerLoading || !speakerOptions?.length || ttsBusy}
+                    >
+                      {speakerOptions?.length ? (
+                        speakerOptions.map((option) => (
+                          <option key={option.id} value={option.id}>
+                            {option.label}
+                          </option>
+                        ))
+                      ) : (
+                        <option value="" disabled>
+                          {speakerLoading ? '話者を取得中...' : '話者一覧を読み込んでください'}
+                        </option>
+                      )}
+                    </select>
+                  </label>
+                  <button
+                    type="button"
+                    className="refresh-button"
+                    onClick={handleRefreshSpeakers}
+                    disabled={speakerLoading}
+                  >
+                    {speakerLoading ? '更新中...' : '話者を更新'}
+                  </button>
+                </div>
+                {speakerError && <p className="status error">{speakerError}</p>}
+              </>
+            ) : (
+              <>
+                <p className="tts-tip">
+                  WEB版 VOICEVOX API（高速）で音声を生成します。都度ポイントが消費されます。{' '}
+                  <a href="https://voicevox.su-shiki.com/su-shikiapis/" target="_blank" rel="noreferrer">
+                    https://voicevox.su-shiki.com/su-shikiapis/
+                  </a>
+                </p>
                 <label className="input-field">
-                  <span>話者 ID</span>
+                  <span>API キー</span>
                   <input
-                    type="number"
-                    min="0"
-                    step="1"
-                    value={ttsConfig.cloudSpeakerId}
-                    onChange={(event) => updateTtsConfig({ cloudSpeakerId: event.target.value })}
+                    type="password"
+                    value={ttsConfig.cloudFastApiKey}
+                    onChange={(event) => updateTtsConfig({ cloudFastApiKey: event.target.value })}
+                    placeholder="例: G_7-xxxxxxxx"
                     disabled={ttsBusy}
                   />
                 </label>
+                <div className="speaker-row">
+                  <label className="input-field">
+                    <span>話者</span>
+                    <select
+                      value={ttsConfig.cloudFastSpeakerId}
+                      onChange={(event) => updateTtsConfig({ cloudFastSpeakerId: event.target.value })}
+                      disabled={
+                        speakerLoading || !speakerOptions?.length || ttsBusy || !ttsConfig.cloudFastApiKey.trim()
+                      }
+                    >
+                      {speakerOptions?.length ? (
+                        speakerOptions.map((option) => (
+                          <option key={option.id} value={option.id}>
+                            {option.label}
+                          </option>
+                        ))
+                      ) : (
+                        <option value="" disabled>
+                          {speakerLoading ? '話者を取得中...' : '話者一覧を読み込んでください'}
+                        </option>
+                      )}
+                    </select>
+                  </label>
+                  <button
+                    type="button"
+                    className="refresh-button"
+                    onClick={handleRefreshSpeakers}
+                    disabled={speakerLoading || !ttsConfig.cloudFastApiKey.trim()}
+                  >
+                    {speakerLoading ? '更新中...' : '話者を更新'}
+                  </button>
+                </div>
+                {speakerError && <p className="status error">{speakerError}</p>}
               </>
             )}
             <label className="input-field">
