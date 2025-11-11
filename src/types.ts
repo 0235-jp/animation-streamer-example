@@ -5,6 +5,8 @@ export type MotionType =
   | 'speechLoopSmall'
   | 'speechToIdle'
 
+export type ClipOrigin = 'upload' | 'imageGenerator'
+
 export interface ClipAsset {
   id: string
   file: File
@@ -12,6 +14,7 @@ export interface ClipAsset {
   name: string
   duration: number
   type: MotionType
+  origin?: ClipOrigin
 }
 
 export interface AudioSegment {

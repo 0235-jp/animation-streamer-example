@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent, DragEvent } from 'react'
 import type { FFmpeg as FFmpegInstance } from '@ffmpeg/ffmpeg'
 import type JSZip from 'jszip'
@@ -17,7 +17,7 @@ import {
   synthesizeVoicevoxCloud,
   synthesizeVoicevoxFast,
 } from './lib/tts'
-import type { ClipAsset, MotionType, TimelinePlan } from './types'
+import type { ClipAsset, ClipOrigin, MotionType, TimelinePlan } from './types'
 
 const motionLabels: Record<MotionType, string> = {
   idle: '待機',
@@ -45,6 +45,138 @@ interface VoicevoxSpeakerOption {
 const TTS_STORAGE_KEY = 'animation-streamer-example::tts-config'
 const TTS_PROVIDER_KEY = 'animation-streamer-example::tts-provider'
 const AUDIO_MODE_KEY = 'animation-streamer-example::audio-mode'
+const CLIP_MODE_STORAGE_KEY = 'animation-streamer-example::clip-mode'
+const IMAGE_GENERATOR_OPTIONS_KEY = 'animation-streamer-example::image-generator-options'
+
+type ClipInputMode = 'upload' | 'image'
+type MouthImageKind = 'closed' | 'open'
+
+interface MouthImageSlot {
+  file: File | null
+  previewUrl: string | null
+  width: number | null
+  height: number | null
+}
+
+interface ImageGeneratorOptions {
+  frameDuration: number
+}
+
+const defaultImageGeneratorOptions: ImageGeneratorOptions = {
+  frameDuration: 0.08,
+}
+
+const clipGenerationOrder: MotionType[] = ['idle', 'idleToSpeech', 'speechToIdle', 'speechLoopSmall', 'speechLoopLarge']
+
+const mouthImageLabels: Record<MouthImageKind, string> = {
+  closed: '口を閉じている画像',
+  open: '口を開いている画像',
+}
+
+const mouthImageOrder: MouthImageKind[] = ['closed', 'open']
+
+const createEmptyMouthImageSlot = (): MouthImageSlot => ({
+  file: null,
+  previewUrl: null,
+  width: null,
+  height: null,
+})
+
+const MOUTH_IMAGE_ACCEPT = 'image/png,image/jpeg,image/webp'
+const MAX_IMAGE_FILE_SIZE = 10 * 1024 * 1024
+const MAX_IMAGE_DIMENSION = 4096
+const MIN_FRAME_DURATION = 0.03
+const MAX_FRAME_DURATION = 1
+const ASPECT_RATIO_WARNING_THRESHOLD = 0.3
+const IMAGE_CANVAS_BACKGROUND = '#ffffff'
+
+const buildDefaultImageGeneratorOptions = (): ImageGeneratorOptions => ({ ...defaultImageGeneratorOptions })
+
+const coerceImageGeneratorOptions = (raw: unknown): ImageGeneratorOptions => {
+  if (!raw || typeof raw !== 'object') return buildDefaultImageGeneratorOptions()
+  const data = raw as Partial<ImageGeneratorOptions>
+  const frameDurationValue = typeof data.frameDuration === 'number' ? data.frameDuration : Number(data.frameDuration)
+  const frameDuration = Number.isFinite(frameDurationValue)
+    ? Math.min(MAX_FRAME_DURATION, Math.max(MIN_FRAME_DURATION, frameDurationValue))
+    : defaultImageGeneratorOptions.frameDuration
+  return {
+    frameDuration,
+  }
+}
+
+const persistImageGeneratorOptions = (options: ImageGeneratorOptions) => {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(
+      IMAGE_GENERATOR_OPTIONS_KEY,
+      JSON.stringify({ imageGen: options })
+    )
+  } catch {
+    // ignore
+  }
+}
+
+const readStoredImageGeneratorOptions = (): ImageGeneratorOptions => {
+  if (typeof window === 'undefined') return buildDefaultImageGeneratorOptions()
+  try {
+    const raw = window.localStorage.getItem(IMAGE_GENERATOR_OPTIONS_KEY)
+    if (!raw) return buildDefaultImageGeneratorOptions()
+    const parsed = JSON.parse(raw) as { imageGen?: unknown }
+    if (parsed.imageGen) return coerceImageGeneratorOptions(parsed.imageGen)
+  } catch {
+    // ignore
+  }
+  return buildDefaultImageGeneratorOptions()
+}
+
+const readStoredClipMode = (): ClipInputMode => {
+  if (typeof window === 'undefined') return 'upload'
+  try {
+    const raw = window.localStorage.getItem(CLIP_MODE_STORAGE_KEY)
+    return raw === 'image' ? 'image' : 'upload'
+  } catch {
+    return 'upload'
+  }
+}
+
+const clipFrameRecipes: Record<MotionType, MouthImageKind[]> = {
+  idle: ['closed'],
+  idleToSpeech: ['closed', 'open'],
+  speechLoopSmall: ['open', 'closed', 'open'],
+  speechLoopLarge: ['open', 'closed', 'open'],
+  speechToIdle: ['open', 'closed'],
+}
+
+const mouthImageFilenames: Record<MouthImageKind, string> = {
+  closed: 'mouth_closed.png',
+  open: 'mouth_open.png',
+}
+
+interface CodecPreset {
+  extension: string
+  mimeType: string
+  outputArgs: string[]
+}
+const defaultCodecPreset: CodecPreset = {
+  extension: 'mp4',
+  mimeType: 'video/mp4',
+  outputArgs: [
+    '-c:v',
+    'libx264',
+    '-pix_fmt',
+    'yuv420p',
+    '-profile:v',
+    'baseline',
+    '-level',
+    '3.0',
+    '-movflags',
+    '+faststart',
+    '-preset',
+    'veryfast',
+    '-crf',
+    '23',
+  ],
+}
 
 const defaultTtsConfig: TtsUiConfig = {
   localEndpoint: 'http://localhost:50021',
@@ -202,7 +334,11 @@ const isAudioFile = (file: File) =>
 
 const videoExtensionPattern = /\.(mp4|webm|mov)$/i
 
+const imageExtensionPattern = /\.(png|jpe?g|webp)$/i
+
 const isVideoFile = (file: File) => file.type.startsWith('video/') || videoExtensionPattern.test(file.name)
+
+const isSupportedImageFile = (file: File) => file.type.startsWith('image/') || imageExtensionPattern.test(file.name)
 
 const isZipFile = (file: File) => file.type === 'application/zip' || /\.zip$/i.test(file.name)
 
@@ -291,12 +427,30 @@ function App() {
   const clipUrls = useRef(new Set<string>())
   const [videoStatus, setVideoStatus] = useState<string | null>(null)
   const [videoError, setVideoError] = useState<string | null>(null)
+  const [clipInputMode, setClipInputMode] = useState<ClipInputMode>(() => readStoredClipMode())
+  const [imageGenOptions, setImageGenOptions] = useState<ImageGeneratorOptions>(() => readStoredImageGeneratorOptions())
+  const [imageGenBusy, setImageGenBusy] = useState(false)
+  const [imageGenStatus, setImageGenStatus] = useState<string | null>(null)
+  const [imageGenError, setImageGenError] = useState<string | null>(null)
+  const [imageGenResultIds, setImageGenResultIds] = useState<string[]>([])
+  const [imageGenDownloadBusy, setImageGenDownloadBusy] = useState(false)
+  const [mouthImages, setMouthImages] = useState<Record<MouthImageKind, MouthImageSlot>>(() => ({
+    closed: createEmptyMouthImageSlot(),
+    open: createEmptyMouthImageSlot(),
+  }))
+  const mouthImageUrls = useRef<Record<MouthImageKind, string | null>>({ closed: null, open: null })
 
   const [plan, setPlan] = useState<TimelinePlan | null>(null)
   const [planError, setPlanError] = useState<string | null>(null)
 
   const audioInputRef = useRef<HTMLInputElement | null>(null)
   const clipInputRef = useRef<HTMLInputElement | null>(null)
+  const closedImageInputRef = useRef<HTMLInputElement | null>(null)
+  const openImageInputRef = useRef<HTMLInputElement | null>(null)
+  const mouthImageInputRefs: Record<MouthImageKind, typeof closedImageInputRef> = {
+    closed: closedImageInputRef,
+    open: openImageInputRef,
+  }
 
   const [audioDragActive, setAudioDragActive] = useState(false)
 
@@ -349,6 +503,72 @@ const [ttsProvider, setTtsProvider] = useState<TtsProvider>(() => getInitialTtsP
   const updateTtsConfig = (patch: Partial<TtsUiConfig>) => {
     applyTtsConfig((prev) => ({ ...prev, ...patch }))
   }
+
+  const applyImageGenOptions = useCallback(
+    (updater: (prev: ImageGeneratorOptions) => ImageGeneratorOptions) => {
+      setImageGenOptions((prev) => {
+        const next = updater(prev)
+        if (next === prev) return prev
+        persistImageGeneratorOptions(next)
+        return next
+      })
+    },
+    []
+  )
+
+  const updateImageGenOptions = (patch: Partial<ImageGeneratorOptions>) => {
+    applyImageGenOptions((prev) => ({
+      ...prev,
+      ...patch,
+    }))
+  }
+
+  const aspectWarning = useMemo(() => {
+    const closed = mouthImages.closed
+    const open = mouthImages.open
+    if (!closed.width || !closed.height || !open.width || !open.height) return null
+    if (!closed.height || !open.height) return null
+    const closedRatio = closed.width / closed.height
+    const openRatio = open.width / open.height
+    if (!Number.isFinite(closedRatio) || !Number.isFinite(openRatio)) return null
+    const diff = Math.abs(closedRatio - openRatio) / closedRatio
+    if (diff > ASPECT_RATIO_WARNING_THRESHOLD) {
+      return '2 枚の画像で縦横比が大きく異なるため、生成される動画がわずかに歪む可能性があります'
+    }
+    return null
+  }, [
+    mouthImages.closed.width,
+    mouthImages.closed.height,
+    mouthImages.open.width,
+    mouthImages.open.height,
+  ])
+
+  const imagesReady = Boolean(
+    mouthImages.closed.file &&
+    mouthImages.open.file &&
+    mouthImages.closed.width &&
+    mouthImages.closed.height &&
+    mouthImages.open.width &&
+    mouthImages.open.height
+  )
+
+  const hasAutoGeneratedClips = useMemo(() => clips.some((clip) => clip.origin === 'imageGenerator'), [clips])
+
+  const autoGeneratedClipCount = useMemo(
+    () => clips.filter((clip) => clip.origin === 'imageGenerator').length,
+    [clips]
+  )
+
+  const latestGeneratedClips = useMemo(
+    () => clips.filter((clip) => imageGenResultIds.includes(clip.id)),
+    [clips, imageGenResultIds]
+  )
+
+  const canGenerateFromImages = Boolean(!imageGenBusy && !imageGenDownloadBusy && imagesReady)
+
+  const canDownloadAutoGeneratedClips = Boolean(
+    hasAutoGeneratedClips && !imageGenBusy && !imageGenDownloadBusy
+  )
 
   const loadSpeakerOptions = useCallback(
     async (provider: TtsProvider) => {
@@ -409,6 +629,16 @@ const [ttsProvider, setTtsProvider] = useState<TtsProvider>(() => getInitialTtsP
     []
   )
 
+  useEffect(
+    () => () => {
+      mouthImageOrder.forEach((kind) => {
+        const url = mouthImageUrls.current[kind]
+        if (url) URL.revokeObjectURL(url)
+      })
+    },
+    []
+  )
+
   useEffect(() => {
     return () => {
       if (ffmpegRef.current && logHandlerRef.current) {
@@ -451,6 +681,15 @@ const [ttsProvider, setTtsProvider] = useState<TtsProvider>(() => getInitialTtsP
   }, [ttsProvider])
 
   useEffect(() => {
+    if (typeof window === 'undefined') return
+    try {
+      window.localStorage.setItem(CLIP_MODE_STORAGE_KEY, clipInputMode)
+    } catch {
+      // ignore
+    }
+  }, [clipInputMode])
+
+  useEffect(() => {
     if (ttsProvider === 'local') {
       setSpeakerOptions(null)
       setSpeakerError(null)
@@ -479,6 +718,10 @@ const [ttsProvider, setTtsProvider] = useState<TtsProvider>(() => getInitialTtsP
       setPlanError(error instanceof Error ? error.message : String(error))
     }
   }, [analysis, clips])
+
+  useEffect(() => {
+    setImageGenResultIds((prev) => prev.filter((id) => clips.some((clip) => clip.id === id)))
+  }, [clips])
 
   const ensureFfmpeg = useCallback(async (): Promise<FFmpegInstance> => {
     if (!ffmpegRef.current) {
@@ -623,25 +866,150 @@ const [ttsProvider, setTtsProvider] = useState<TtsProvider>(() => getInitialTtsP
     await processAudioFile(file)
   }
 
-  const loadClipAsset = async (file: File, type: MotionType): Promise<ClipAsset> => {
-    const url = URL.createObjectURL(file)
-    clipUrls.current.add(url)
-    try {
-      const duration = await readVideoDuration(url)
-      return {
-        id: createId(),
-        file,
-        url,
-        name: file.name,
-        duration: Number.isFinite(duration) && duration > 0 ? duration : 1,
-        type,
+  const updateMouthImageSlot = (kind: MouthImageKind, slot: MouthImageSlot) => {
+    setMouthImages((prev) => {
+      const prevUrl = mouthImageUrls.current[kind]
+      const nextUrl = slot.previewUrl ?? null
+      if (prevUrl && prevUrl !== nextUrl) {
+        URL.revokeObjectURL(prevUrl)
       }
+      mouthImageUrls.current[kind] = nextUrl
+      const nextSlot: MouthImageSlot = {
+        file: slot.file ?? null,
+        previewUrl: nextUrl,
+        width: slot.width ?? null,
+        height: slot.height ?? null,
+      }
+      if (
+        prev[kind].file === nextSlot.file &&
+        prev[kind].previewUrl === nextSlot.previewUrl &&
+        prev[kind].width === nextSlot.width &&
+        prev[kind].height === nextSlot.height
+      ) {
+        return prev
+      }
+      return {
+        ...prev,
+        [kind]: nextSlot,
+      }
+    })
+  }
+
+  const resetMouthImages = () => {
+    mouthImageOrder.forEach((kind) => clearMouthImage(kind))
+  }
+
+  const clearMouthImage = (kind: MouthImageKind) => {
+    updateMouthImageSlot(kind, createEmptyMouthImageSlot())
+  }
+
+  const handleMouthImageSelection = async (kind: MouthImageKind, file: File | null) => {
+    if (!file) {
+      clearMouthImage(kind)
+      return
+    }
+    if (!isSupportedImageFile(file)) {
+      setImageGenError('PNG / JPEG / WebP の画像のみ利用できます')
+      return
+    }
+    if (file.size > MAX_IMAGE_FILE_SIZE) {
+      setImageGenError('画像サイズは 10MB 以下にしてください')
+      return
+    }
+    try {
+      const meta = await loadImagePreviewMetadata(file)
+      if (meta.width > MAX_IMAGE_DIMENSION || meta.height > MAX_IMAGE_DIMENSION) {
+        URL.revokeObjectURL(meta.url)
+        setImageGenError(`画像の一辺は ${MAX_IMAGE_DIMENSION}px 以内にしてください`)
+        return
+      }
+      updateMouthImageSlot(kind, {
+        file,
+        previewUrl: meta.url,
+        width: meta.width,
+        height: meta.height,
+      })
+      setImageGenError(null)
     } catch (error) {
-      URL.revokeObjectURL(url)
-      clipUrls.current.delete(url)
-      throw error
+      setImageGenError(error instanceof Error ? error.message : '画像の読み込みに失敗しました')
     }
   }
+
+  const handleMouthImageInputChange = (kind: MouthImageKind, event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0] ?? null
+    event.target.value = ''
+    void handleMouthImageSelection(kind, file)
+  }
+
+  const handleMouthImageDrop = (kind: MouthImageKind, event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    const file = event.dataTransfer?.files?.[0]
+    if (!file) return
+    void handleMouthImageSelection(kind, file)
+  }
+
+  const handleMouthImageDragOver = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault()
+  }
+
+  const handleMouthImageZoneClick = (kind: MouthImageKind) => {
+    mouthImageInputRefs[kind].current?.click()
+  }
+
+  const handleClipModeSwitch = (mode: ClipInputMode) => {
+    if (mode === clipInputMode) return
+    if ((imageGenBusy || imageGenDownloadBusy) && clipInputMode === 'image') return
+    setClipInputMode(mode)
+  }
+
+  const handleFrameDurationInput = (raw: string) => {
+    const value = Number(raw)
+    if (!Number.isFinite(value)) return
+    const clamped = Math.min(MAX_FRAME_DURATION, Math.max(MIN_FRAME_DURATION, value))
+    updateImageGenOptions({ frameDuration: clamped })
+  }
+
+  const handleRemoveAutoGeneratedClips = () => {
+    if (!hasAutoGeneratedClips) return
+    resetOutput()
+    setClips((prev) => {
+      const survivors: ClipAsset[] = []
+      for (const clip of prev) {
+        if (clip.origin === 'imageGenerator') {
+          URL.revokeObjectURL(clip.url)
+          clipUrls.current.delete(clip.url)
+          continue
+        }
+        survivors.push(clip)
+      }
+      return survivors
+    })
+    setImageGenResultIds([])
+  }
+
+  const loadClipAsset = useCallback(
+    async (file: File, type: MotionType, options?: { origin?: ClipOrigin }): Promise<ClipAsset> => {
+      const url = URL.createObjectURL(file)
+      clipUrls.current.add(url)
+      try {
+        const duration = await readVideoDuration(url)
+        return {
+          id: createId(),
+          file,
+          url,
+          name: file.name,
+          duration: Number.isFinite(duration) && duration > 0 ? duration : 1,
+          type,
+          origin: options?.origin,
+        }
+      } catch (error) {
+        URL.revokeObjectURL(url)
+        clipUrls.current.delete(url)
+        throw error
+      }
+    },
+    []
+  )
 
   const processClipFiles = async (files: File[]) => {
     const zipFiles = files.filter(isZipFile)
@@ -668,7 +1036,7 @@ const [ttsProvider, setTtsProvider] = useState<TtsProvider>(() => getInitialTtsP
       for (const { file, typeHint } of allVideos) {
         // 読み込みは順番に実施し、ブラウザのデコーダ負荷を抑える
         // （大量の動画を同時に処理するとタブがフリーズしやすいため）。
-        const asset = await loadClipAsset(file, typeHint ?? 'idle')
+        const asset = await loadClipAsset(file, typeHint ?? 'idle', { origin: 'upload' })
         assets.push(asset)
       }
       setClips((prev) => [...prev, ...assets])
@@ -678,6 +1046,154 @@ const [ttsProvider, setTtsProvider] = useState<TtsProvider>(() => getInitialTtsP
       setVideoStatus(null)
     }
   }
+
+  const handleGenerateFromImages = useCallback(async () => {
+    if (!mouthImages.closed.file || !mouthImages.open.file) {
+      setImageGenError('口を閉じた画像と開いた画像を両方アップロードしてください')
+      return
+    }
+    if (
+      !mouthImages.closed.width ||
+      !mouthImages.closed.height ||
+      !mouthImages.open.width ||
+      !mouthImages.open.height
+    ) {
+      setImageGenError('画像の読み込み結果を確認できませんでした')
+      return
+    }
+    const outputWidth = Math.max(mouthImages.closed.width, mouthImages.open.width)
+    const outputHeight = Math.max(mouthImages.closed.height, mouthImages.open.height)
+    const cleanupTargets: string[] = []
+    setImageGenBusy(true)
+    setImageGenStatus('FFmpeg を初期化しています...')
+    setImageGenError(null)
+    resetOutput()
+    const frameDuration = Math.min(
+      MAX_FRAME_DURATION,
+      Math.max(MIN_FRAME_DURATION, imageGenOptions.frameDuration)
+    )
+    try {
+      const ffmpeg = await ensureFfmpeg()
+      setImageGenStatus('画像を整形しています...')
+      const closedBytes = await rasterizeImageToPng(
+        mouthImages.closed.file,
+        outputWidth,
+        outputHeight,
+        IMAGE_CANVAS_BACKGROUND
+      )
+      const openBytes = await rasterizeImageToPng(
+        mouthImages.open.file,
+        outputWidth,
+        outputHeight,
+        IMAGE_CANVAS_BACKGROUND
+      )
+      await ffmpeg.writeFile(mouthImageFilenames.closed, closedBytes)
+      await ffmpeg.writeFile(mouthImageFilenames.open, openBytes)
+      cleanupTargets.push(mouthImageFilenames.closed, mouthImageFilenames.open)
+
+      const codecPreset = defaultCodecPreset
+      const generatedAssets: ClipAsset[] = []
+      for (const type of clipGenerationOrder) {
+        const recipe = clipFrameRecipes[type]
+        if (!recipe) continue
+        setImageGenStatus(`${motionLabels[type]} を生成しています...`)
+        const outputName = `autogen_${type}.${codecPreset.extension}`
+        try {
+          await ffmpeg.deleteFile(outputName)
+        } catch {
+          // ignore residual files
+        }
+        const videoData = await generateMotionClipVideo(
+          ffmpeg,
+          recipe,
+          frameDuration,
+          outputName,
+          codecPreset
+        )
+        cleanupTargets.push(outputName)
+        const file = new File([videoData as unknown as BlobPart], `autogen-${type}.${codecPreset.extension}`, {
+          type: codecPreset.mimeType,
+          lastModified: Date.now(),
+        })
+        const asset = await loadClipAsset(file, type, { origin: 'imageGenerator' })
+        generatedAssets.push(asset)
+      }
+
+      setClips((prev) => {
+        const filtered: ClipAsset[] = []
+        for (const clip of prev) {
+          if (clip.origin === 'imageGenerator' && clipGenerationOrder.includes(clip.type)) {
+            URL.revokeObjectURL(clip.url)
+            clipUrls.current.delete(clip.url)
+            continue
+          }
+          filtered.push(clip)
+        }
+        return [...filtered, ...generatedAssets]
+      })
+      setImageGenResultIds(generatedAssets.map((clip) => clip.id))
+      setImageGenStatus('クリップを追加しました')
+    } catch (error) {
+      setImageGenError(error instanceof Error ? error.message : '画像から動画の生成に失敗しました')
+      setImageGenResultIds([])
+    } finally {
+      const ffmpeg = ffmpegRef.current
+      if (ffmpeg) {
+        for (const target of cleanupTargets) {
+          try {
+            await ffmpeg.deleteFile(target)
+          } catch {
+            // ignore cleanup errors
+          }
+        }
+      }
+      setImageGenBusy(false)
+    }
+  }, [
+    mouthImages.closed.file,
+    mouthImages.closed.width,
+    mouthImages.closed.height,
+    mouthImages.open.file,
+    mouthImages.open.width,
+    mouthImages.open.height,
+    imageGenOptions.frameDuration,
+    ensureFfmpeg,
+    loadClipAsset,
+  ])
+
+  const handleDownloadAutoGeneratedClips = useCallback(async () => {
+    const autoClips = clips.filter((clip) => clip.origin === 'imageGenerator')
+    if (!autoClips.length) return
+    setImageGenDownloadBusy(true)
+    setImageGenStatus('ZIP を作成しています...')
+    setImageGenError(null)
+    try {
+      const { default: JSZipModule } = await import('jszip')
+      const zip = new JSZipModule()
+      for (const clip of autoClips) {
+        zip.file(clip.file.name, await clip.file.arrayBuffer())
+      }
+      const manifest = {
+        videos: autoClips.map((clip) => ({ file: clip.file.name, type: clip.type })),
+      }
+      zip.file(videoTypeManifestFile, JSON.stringify(manifest, null, 2))
+      const blob = await zip.generateAsync({ type: 'blob' })
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').replace('Z', '')
+      link.download = `autogen-motions-${timestamp}.zip`
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+      URL.revokeObjectURL(url)
+      setImageGenStatus('ZIP をダウンロードしました')
+    } catch (error) {
+      setImageGenError(error instanceof Error ? error.message : 'ZIP の作成に失敗しました')
+    } finally {
+      setImageGenDownloadBusy(false)
+    }
+  }, [clips])
 
   const handleClipChange = (event: ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files ? Array.from(event.target.files) : []
@@ -825,26 +1341,186 @@ const [ttsProvider, setTtsProvider] = useState<TtsProvider>(() => getInitialTtsP
             <h2>1. モーションクリップ</h2>
             <p>待機/遷移/発話(大/小)の各カテゴリに最低 1 本ずつ登録してください。</p>
           </div>
-          {videoStatus && <span className="status">{videoStatus}</span>}
         </div>
-        {videoError && <p className="status error">{videoError}</p>}
-        <div
-          className="dropzone small central-drop"
-          onClick={handleClipZoneClick}
-          onDragOver={handleClipDragOver}
-          onDrop={handleClipDrop}
-        >
-          <p className="dropzone-title">動画をまとめてドラッグ＆ドロップ</p>
-          <p className="dropzone-sub">またはクリックして追加（ZIP で一括アップロードも可能／あとでカテゴリを割り当て）</p>
-          <input
-            ref={clipInputRef}
-            type="file"
-            accept="video/mp4,video/webm,video/quicktime,application/zip,.zip"
-            multiple
-            hidden
-            onChange={handleClipChange}
-          />
+        <div className="clip-mode-switch">
+          <button
+            type="button"
+            className={`clip-mode-button ${clipInputMode === 'upload' ? 'is-active' : ''}`}
+            onClick={() => handleClipModeSwitch('upload')}
+            disabled={imageGenBusy}
+          >
+            動画をアップロード
+          </button>
+          <button
+            type="button"
+            className={`clip-mode-button ${clipInputMode === 'image' ? 'is-active' : ''}`}
+            onClick={() => handleClipModeSwitch('image')}
+            disabled={imageGenBusy}
+          >
+            画像から生成
+          </button>
         </div>
+
+        {clipInputMode === 'upload' ? (
+          <>
+            {videoError && <p className="status error">{videoError}</p>}
+            {videoStatus && <p className="status">{videoStatus}</p>}
+            <div
+              className="dropzone small central-drop"
+              onClick={handleClipZoneClick}
+              onDragOver={handleClipDragOver}
+              onDrop={handleClipDrop}
+            >
+              <p className="dropzone-title">動画をまとめてドラッグ＆ドロップ</p>
+              <p className="dropzone-sub">またはクリックして追加（ZIP で一括アップロードも可能／あとでカテゴリを割り当て）</p>
+              <input
+                ref={clipInputRef}
+                type="file"
+                accept="video/mp4,video/webm,video/quicktime,application/zip,.zip"
+                multiple
+                hidden
+                onChange={handleClipChange}
+              />
+            </div>
+          </>
+        ) : (
+          <div className="image-generator">
+            {imageGenError && <p className="status error">{imageGenError}</p>}
+            {imageGenStatus && <p className="status">{imageGenStatus}</p>}
+            <p className="image-gen-tip">口の開閉 2 枚の画像から idle / speech 系のモーション動画をまとめて作成できます。</p>
+            {aspectWarning && <p className="status warning">{aspectWarning}</p>}
+            <div className="image-gen-grid">
+              {mouthImageOrder.map((kind) => {
+                const slot = mouthImages[kind]
+                return (
+                  <div key={kind} className={`image-slot ${slot.file ? 'has-image' : ''}`}>
+                    <div
+                      className="image-slot-drop"
+                      onClick={() => handleMouthImageZoneClick(kind)}
+                      onDragOver={handleMouthImageDragOver}
+                      onDrop={(event) => handleMouthImageDrop(kind, event)}
+                    >
+                      {slot.previewUrl ? (
+                        <img src={slot.previewUrl} alt={mouthImageLabels[kind]} />
+                      ) : (
+                        <div className="image-slot-placeholder">
+                          <p>{mouthImageLabels[kind]}</p>
+                          <p className="muted">PNG/JPEG/WebP・最大 4096px / 10MB</p>
+                        </div>
+                      )}
+                    </div>
+                    <div className="image-slot-meta">
+                      <span>
+                        {slot.width && slot.height ? `${slot.width}×${slot.height}px` : '未読み込み'}
+                      </span>
+                      {slot.file ? (
+                        <div className="image-slot-actions">
+                          <button
+                            type="button"
+                            className="ghost"
+                            onClick={() => mouthImageInputRefs[kind].current?.click()}
+                            disabled={imageGenBusy}
+                          >
+                            差し替え
+                          </button>
+                          <button
+                            type="button"
+                            className="ghost"
+                            onClick={() => clearMouthImage(kind)}
+                            disabled={imageGenBusy}
+                          >
+                            削除
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          className="ghost"
+                          onClick={() => mouthImageInputRefs[kind].current?.click()}
+                          disabled={imageGenBusy}
+                        >
+                          画像を選ぶ
+                        </button>
+                      )}
+                    </div>
+                    <input
+                      ref={mouthImageInputRefs[kind]}
+                      type="file"
+                      accept={MOUTH_IMAGE_ACCEPT}
+                      hidden
+                      onChange={(event) => handleMouthImageInputChange(kind, event)}
+                      disabled={imageGenBusy}
+                    />
+                  </div>
+                )
+              })}
+            </div>
+
+            <div className="image-gen-options">
+              <label className="input-field">
+                <span>1 フレームの長さ (秒)</span>
+                <input
+                  type="number"
+                  min={MIN_FRAME_DURATION}
+                  max={MAX_FRAME_DURATION}
+                  step={0.01}
+                  value={imageGenOptions.frameDuration}
+                  onChange={(event) => handleFrameDurationInput(event.target.value)}
+                  disabled={imageGenBusy}
+                />
+              </label>
+              <p className="image-gen-hint">
+                speechLoopLarge は speechLoopSmall と同じ映像です。元画像より小さい場合は白背景で余白を埋めます。
+              </p>
+            </div>
+
+            <div className="image-gen-actions">
+              <button
+                type="button"
+                className="primary-button"
+                onClick={() => void handleGenerateFromImages()}
+                disabled={!canGenerateFromImages}
+              >
+                画像からモーションクリップを生成
+              </button>
+              <button type="button" className="secondary-button" onClick={resetMouthImages} disabled={imageGenBusy}>
+                画像をリセット
+              </button>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => void handleDownloadAutoGeneratedClips()}
+                disabled={!canDownloadAutoGeneratedClips}
+              >
+                モーションをダウンロード
+              </button>
+              <button
+                type="button"
+                className="ghost"
+                onClick={handleRemoveAutoGeneratedClips}
+                disabled={!hasAutoGeneratedClips || imageGenBusy || imageGenDownloadBusy}
+              >
+                自動生成クリップを削除
+                {hasAutoGeneratedClips ? `（${autoGeneratedClipCount}）` : ''}
+              </button>
+            </div>
+
+            {latestGeneratedClips.length > 0 && (
+              <div className="image-gen-preview">
+                <p>今回追加されたクリップ</p>
+                <div className="image-gen-preview-grid">
+                  {latestGeneratedClips.map((clip) => (
+                    <div key={clip.id} className="image-gen-preview-card">
+                      <strong>{motionLabels[clip.type]}</strong>
+                      <video src={clip.url} autoPlay loop muted playsInline />
+                      <span>{formatSeconds(clip.duration)}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
         {clips.length === 0 ? (
           <p className="empty">動画がまだありません。複数ファイルをまとめて追加できます。</p>
         ) : (
@@ -861,7 +1537,12 @@ const [ttsProvider, setTtsProvider] = useState<TtsProvider>(() => getInitialTtsP
               <tbody>
                 {clips.map((clip) => (
                   <tr key={clip.id}>
-                    <td>{clip.name}</td>
+                    <td>
+                      <div className="clip-name-cell">
+                        <span>{clip.name}</span>
+                        {clip.origin === 'imageGenerator' && <span className="clip-tag">AutoGen</span>}
+                      </div>
+                    </td>
                     <td>{formatSeconds(clip.duration)}</td>
                     <td>
                       <select value={clip.type} onChange={(event) => updateClipType(clip.id, event.target.value as MotionType)}>
@@ -1259,5 +1940,83 @@ const readVideoDuration = (url: string) =>
       reject(new Error('メタデータの読み込みに失敗しました'))
     }
   })
+
+const loadImagePreviewMetadata = (file: File) =>
+  new Promise<{ url: string; width: number; height: number }>((resolve, reject) => {
+    const url = URL.createObjectURL(file)
+    const image = new Image()
+    image.onload = () => {
+      resolve({ url, width: image.naturalWidth || image.width, height: image.naturalHeight || image.height })
+    }
+    image.onerror = () => {
+      URL.revokeObjectURL(url)
+      reject(new Error('画像の読み込みに失敗しました'))
+    }
+    image.src = url
+  })
+
+const loadImageElement = (file: File) =>
+  new Promise<HTMLImageElement>((resolve, reject) => {
+    const url = URL.createObjectURL(file)
+    const image = new Image()
+    image.onload = () => {
+      URL.revokeObjectURL(url)
+      resolve(image)
+    }
+    image.onerror = () => {
+      URL.revokeObjectURL(url)
+      reject(new Error('画像の読み込みに失敗しました'))
+    }
+    image.src = url
+  })
+
+const rasterizeImageToPng = async (
+  file: File,
+  width: number,
+  height: number,
+  background: string
+) => {
+  const image = await loadImageElement(file)
+  const sourceWidth = image.naturalWidth || image.width
+  const sourceHeight = image.naturalHeight || image.height
+  const canvas = document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  const ctx = canvas.getContext('2d')
+  if (!ctx) throw new Error('Canvas が利用できません')
+  ctx.fillStyle = background
+  ctx.fillRect(0, 0, width, height)
+  const dx = Math.round((width - sourceWidth) / 2)
+  const dy = Math.round((height - sourceHeight) / 2)
+  ctx.drawImage(image, dx, dy, sourceWidth, sourceHeight)
+  const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'))
+  if (!blob) throw new Error('画像の変換に失敗しました')
+  return new Uint8Array(await blob.arrayBuffer())
+}
+
+const generateMotionClipVideo = async (
+  ffmpeg: FFmpegInstance,
+  frames: MouthImageKind[],
+  frameDuration: number,
+  outputName: string,
+  codecPreset: CodecPreset
+) => {
+  if (!frames.length) throw new Error('フレームが不足しています')
+  const args: string[] = []
+  const durationArg = frameDuration.toFixed(3)
+  for (const frame of frames) {
+    args.push('-loop', '1', '-t', durationArg, '-i', mouthImageFilenames[frame])
+  }
+  if (frames.length > 1) {
+    args.push('-filter_complex', `concat=n=${frames.length}:v=1:a=0`)
+  }
+  args.push('-r', '30', '-an', ...codecPreset.outputArgs, outputName)
+  await ffmpeg.exec(args)
+  const data = await ffmpeg.readFile(outputName)
+  if (typeof data === 'string') {
+    throw new Error('生成した動画の読み込みに失敗しました')
+  }
+  return data
+}
 
 export default App
